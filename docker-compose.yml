@@ -50,55 +50,11 @@ services:
       - shared_app_data:/data
     command: ["sh", "-c", "echo 'Init container for setup if needed'; sleep 1"]
 
-  filebrowser-config-init:
-    image: filebrowser/filebrowser:latest # ✅ Necesita el binario /filebrowser
-    restart: "no"
-    networks:
-      - backend-net
-    # Depende de INIT para que se ejecute después de la configuración global
-    depends_on:
-      init:
-        condition: service_completed_successfully
-    volumes:
-      - filebrowser_data:/srv  # Contiene settings.json y filebrowser.db
-      - shared_app_data:/shared_data      # Mantenemos este montaje si lo necesita para root path
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        echo "Starting Filebrowser config file creation..."
-        # 1. Crear el archivo de configuración JSON (CON AUTH)
-        cat <<'EOF' > /srv/settings.json 
-        {
-          "address": "0.0.0.0",
-          "port": 80,
-          "baseURL": "/filebrowser",
-          "database": "/srv/filebrowser.db", 
-          "root": "/srv",
-          "auth": {
-            "method": "proxy",
-            "header": "X-Forwarded-User",
-            "sessionAuth": false
-          }
-        }
-        EOF
-
-        # ✅ REINTRODUCIR: Inicializar la DB con la configuración de Proxy Auth
-        # Esto es CRÍTICO para que no intente usar el login local
-        /filebrowser -c /srv/settings.json config init
-        
-        # 2. Corregir permisos
-        chmod -R 777 /srv
-        
-        echo "Filebrowser DB initialized with Proxy Auth configuration."
   filebrowser:
     image: filebrowser/filebrowser:latest
     restart: unless-stopped
     networks:
       - backend-net
-    depends_on:
-      filebrowser-config-init:
-        condition: service_completed_successfully
     environment:
       #- FB_BASEURL=/filebrowser
       #- FB_ADDRESS=0.0.0.0
@@ -107,15 +63,16 @@ services:
       - PGID=1000
       - FB_ADDRESS=0.0.0.0
       - FB_PORT=80
-      - FB_BASEURL=/filebrowser # 👈 ¡CRÍTICO para arreglar los assets!
+      - FB_BASE_URL=/filebrowser # 👈 ¡CRÍTICO para arreglar los assets!
       - FB_ROOT=/srv
       - FB_DATABASE=/srv/filebrowser.db #
+      - FB_AUTH_METHOD=json # ✅ NUEVO: Forzar el método de autenticación JSON
     volumes:
       - filebrowser_data:/srv # 👈 Montamos DATA en /srv (Root Path)
       - shared_app_data:/srv/shared_data
       # 💥 MONTAJE CRÍTICO: Montar el archivo settings.json en la ubicación que el log dice.
       # Montaremos el archivo en el volumen filebrowser_data en /config.
-      - filebrowser_data:/config
+      #- filebrowser_data:/config
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.filebrowser.rule=Host(`localhost`) && PathPrefix(`/filebrowser`)"
@@ -130,9 +87,15 @@ services:
       #- "traefik.http.middlewares.filebrowser-addprefix.addPrefix.prefix=/filebrowser"
       # 💥 Aplicamos AMBOS middlewares
       # ✅ Usar SÓLO autenticación y StripPrefix
-      - "traefik.http.routers.filebrowser.middlewares=oauth2-proxy-auth@file,filebrowser-stripprefix"
+      - "traefik.http.routers.filebrowser.middlewares=filebrowser-stripprefix"
       - "traefik.http.services.filebrowser.loadbalancer.server.port=80"
-
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Fixing permissions for shared_data..."
+        chown -R 1000:1000 /srv/shared_data
+        filebrowser -c /srv/filebrowser.db -r /srv
   php:
     build: ./php-fpm
     restart: unless-stopped
