@@ -1,0 +1,363 @@
+volumes:
+  grafana_data:
+  phpmyadmin_data:
+  prometheus_data:
+  dozzle_data:
+  traefik_data:
+  postgres_data:
+  mariadb_data:
+  shared_app_data:
+  filebrowser_data:
+  pgadmin_data:
+
+services:
+  # --- Data Layer (Bases de datos) ---
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks:
+      - data-net
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - 5432:5432
+
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    networks:
+      - data-net
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_DATABASE: demo
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    ports:
+      - 3306:3306
+
+  # --- Backend Layer (backend-net) ---
+  init:
+    image: busybox
+    restart: "no"
+    networks:
+      - backend-net
+    volumes:
+      - shared_app_data:/data
+    command: ["sh", "-c", "echo 'Init container for setup if needed'; sleep 1"]
+
+  filebrowser-config-init:
+    image: filebrowser/filebrowser:latest # ✅ Necesita el binario /filebrowser
+    restart: "no"
+    networks:
+      - backend-net
+    # Depende de INIT para que se ejecute después de la configuración global
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - filebrowser_data:/srv  # Contiene settings.json y filebrowser.db
+      - shared_app_data:/shared_data      # Mantenemos este montaje si lo necesita para root path
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Starting Filebrowser config file creation..."
+        # 1. Crear el archivo de configuración JSON (CON AUTH)
+        cat <<'EOF' > /srv/settings.json 
+        {
+          "address": "0.0.0.0",
+          "port": 80,
+          "baseURL": "/filebrowser",
+          "database": "/srv/filebrowser.db", 
+          "root": "/srv",
+          "auth": {
+            "method": "proxy",
+            "header": "X-Forwarded-User",
+            "sessionAuth": false
+          }
+        }
+        EOF
+
+        # ✅ REINTRODUCIR: Inicializar la DB con la configuración de Proxy Auth
+        # Esto es CRÍTICO para que no intente usar el login local
+        /filebrowser -c /srv/settings.json config init
+        
+        # 2. Corregir permisos
+        chmod -R 777 /srv
+        
+        echo "Filebrowser DB initialized with Proxy Auth configuration."
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    restart: unless-stopped
+    networks:
+      - backend-net
+    depends_on:
+      filebrowser-config-init:
+        condition: service_completed_successfully
+    environment:
+      #- FB_BASEURL=/filebrowser
+      #- FB_ADDRESS=0.0.0.0
+      #- FB_PORT=80
+      - PUID=1000
+      - PGID=1000
+      - FB_ADDRESS=0.0.0.0
+      - FB_PORT=80
+      - FB_BASEURL=/filebrowser # 👈 ¡CRÍTICO para arreglar los assets!
+      - FB_ROOT=/srv
+      - FB_DATABASE=/srv/filebrowser.db #
+    volumes:
+      - filebrowser_data:/srv # 👈 Montamos DATA en /srv (Root Path)
+      - shared_app_data:/srv/shared_data
+      # 💥 MONTAJE CRÍTICO: Montar el archivo settings.json en la ubicación que el log dice.
+      # Montaremos el archivo en el volumen filebrowser_data en /config.
+      - filebrowser_data:/config
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.filebrowser.rule=Host(`localhost`) && PathPrefix(`/filebrowser`)"
+      - "traefik.http.routers.filebrowser.entrypoints=web"
+      - "traefik.http.routers.filebrowser.priority=100"
+
+      # ✅ REINTRODUCIR StripPrefix para quitar el prefijo antes de enviarlo al backend
+      - "traefik.http.middlewares.filebrowser-stripprefix.stripprefix.prefixes=/filebrowser"
+      #- "traefik.http.middlewares.filebrowser-stripprefix.stripprefix.prefixes=/filebrowser"
+      # - "traefik.http.middlewares.filebrowser-basepath.addPrefix.prefix=/filebrowser"
+      # Solo dejamos la autenticación
+      #- "traefik.http.middlewares.filebrowser-addprefix.addPrefix.prefix=/filebrowser"
+      # 💥 Aplicamos AMBOS middlewares
+      # ✅ Usar SÓLO autenticación y StripPrefix
+      - "traefik.http.routers.filebrowser.middlewares=oauth2-proxy-auth@file,filebrowser-stripprefix"
+      - "traefik.http.services.filebrowser.loadbalancer.server.port=80"
+
+  php:
+    build: ./php-fpm
+    restart: unless-stopped
+    networks:
+      - backend-net
+      - data-net
+    volumes:
+      - shared_app_data:/usr/share/nginx/html
+    ports:
+      - 9000:9000
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    restart: unless-stopped
+    networks:
+      - backend-net
+      - data-net
+    environment:
+      PMA_HOST: mariadb
+      PMA_USER: root
+      PMA_PASSWORD: admin
+    depends_on:
+      - mariadb
+    volumes:
+      - phpmyadmin_data:/var/www/html
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.phpmyadmin.rule=Host(`localhost`) && PathPrefix(`/phpmyadmin`)"
+      - "traefik.http.routers.phpmyadmin.entrypoints=web"
+      - "traefik.http.routers.phpmyadmin.priority=100"
+      - "traefik.http.services.phpmyadmin.loadbalancer.server.port=80"
+      - "traefik.http.middlewares.phpmyadmin-stripprefix.stripprefix.prefixes=/phpmyadmin"
+      - "traefik.http.routers.phpmyadmin.middlewares=oauth2-proxy-auth@file,phpmyadmin-stripprefix"
+
+  nginx:
+    build: ./nginx
+    restart: unless-stopped
+    networks:
+      - backend-net
+      - edge-net
+    depends_on:
+      - php
+      - init
+    volumes:
+      - shared_app_data:/var/www/html
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nginx.rule=Host(`localhost`) && PathPrefix(`/web`)"
+      - "traefik.http.routers.nginx.entrypoints=web"
+      - "traefik.http.routers.nginx.priority=100"
+      - "traefik.http.services.nginx.loadbalancer.server.port=80"
+      - "traefik.http.middlewares.nginx-stripprefix.stripprefix.prefixes=/web"
+      - "traefik.http.routers.nginx.middlewares=oauth2-proxy-auth@file,nginx-stripprefix"
+
+  # --- Edge Layer (edge-net) ---
+  prometheus:
+    build: ./prometheus
+    restart: unless-stopped
+    networks:
+      - edge-net
+    volumes:
+      - prometheus_data:/prometheus
+    ports:
+      - 9090:9090
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`localhost`) && PathPrefix(`/prometheus`)"
+      - "traefik.http.routers.prometheus.entrypoints=web"
+      - "traefik.http.routers.prometheus.priority=100"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+      - "traefik.http.middlewares.prometheus-stripprefix.stripprefix.prefixes=/prometheus"
+      - "traefik.http.routers.prometheus.middlewares=oauth2-proxy-auth@file,prometheus-stripprefix"
+
+  grafana:
+    build: ./grafana
+    restart: unless-stopped
+    networks:
+      - edge-net
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+       # IMPORTANT: Tell grafana it's served under a subpath
+      - GF_SERVER_ROOT_URL=http://localhost/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+       # Auth proxy
+      - GF_AUTH_PROXY_ENABLED=true
+      - GF_AUTH_PROXY_HEADER_NAME=X-Auth-Request-Email
+      # - GF_AUTH_PROXY_HEADER_PROPERTY=email  # commented out: not needed when header contains plain email
+      - GF_AUTH_PROXY_AUTO_SIGN_UP=true
+      - GF_USERS_AUTO_ASSIGN_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      
+      # cookies, subpath & proxy behavior
+      - GF_SECURITY_COOKIE_SECURE=false
+      - GF_SECURITY_COOKIE_SAMESITE=lax
+      - GF_LOG_LEVEL=info
+    volumes:
+      - grafana_data:/var/lib/grafana
+    #ports:
+    #  - 3000:3000
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`localhost`) && PathPrefix(`/grafana`)"
+      - "traefik.http.routers.grafana.entrypoints=web"
+      - "traefik.http.routers.grafana.priority=100"
+       # Traefik -> Grafana (strip /grafana)
+      - "traefik.http.middlewares.grafana-stripprefix.stripprefix.prefixes=/grafana"
+      # Router para servir assets estáticos sin ForwardAuth (evita 401 en JS/CSS)
+      - "traefik.http.routers.grafana-assets.rule=Host(`localhost`) && PathPrefix(`/grafana/public`)"
+      - "traefik.http.routers.grafana-assets.entrypoints=web"
+      - "traefik.http.routers.grafana-assets.priority=110"
+      - "traefik.http.routers.grafana-assets.middlewares=grafana-stripprefix"
+      # Router principal (temporalmente SIN ForwardAuth para prueba)
+      - "traefik.http.routers.grafana.middlewares=oauth2-error-handler@file,oauth2-proxy-auth@file"
+      # Puerto interno
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  dozzle:
+    container_name: dozzle
+    image: amir20/dozzle:latest
+    restart: unless-stopped
+    networks:
+      - edge-net
+    environment:
+      - DOZZLE_LEVEL=info
+      - DOZZLE_NO_ANALYTICS=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - dozzle_data:/data
+    ports:
+      - 8888:8080
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dozzle.rule=Host(`localhost`) && PathPrefix(`/dozzle`)"
+      - "traefik.http.routers.dozzle.entrypoints=web"
+      - "traefik.http.routers.dozzle.priority=100"
+      - "traefik.http.services.dozzle.loadbalancer.server.port=8080"
+      - "traefik.http.middlewares.dozzle-stripprefix.stripprefix.prefixes=/dozzle"
+      - "traefik.http.routers.dozzle.middlewares=oauth2-proxy-auth@file,dozzle-stripprefix"
+
+  homer:
+    build: ./homer
+    restart: unless-stopped
+    networks:
+      - edge-net
+    depends_on:
+      - filebrowser
+      - nginx
+    environment:
+      - INIT_ASSETS=0
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.homer.rule=Host(`localhost`) && (Path(`/`) || (PathPrefix(`/`) && !PathPrefix(`/traefik`) && !PathPrefix(`/oauth2`) && !PathPrefix(`/grafana`) && !PathPrefix(`/prometheus`) && !PathPrefix(`/web`) && !PathPrefix(`/phpmyadmin`) && !PathPrefix(`/filebrowser`) && !PathPrefix(`/dozzle`) && !PathPrefix(`/pgadmin`)))"
+      - "traefik.http.routers.homer.entrypoints=web"
+      - "traefik.http.routers.homer.priority=100"
+      - "traefik.http.services.homer.loadbalancer.server.port=8080"
+      - "traefik.http.routers.homer.middlewares=oauth2-error-handler@file,oauth2-proxy-auth@file"
+
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    networks:
+      - data-net
+      - edge-net
+    depends_on:
+      - postgres
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@local.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+      # - PGADMIN_LISTEN_PATH=/pgadmin # <-- Agrega esta línea
+    ports:
+      - 5050:80
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    
+  oauth2-proxy:
+    build: ./oauth2-proxy
+    restart: unless-stopped
+    networks:
+      - edge-net
+    depends_on:
+      - traefik
+    environment:
+      - OAUTH2_PROXY_PROVIDER=oidc
+      - OAUTH2_PROXY_CLIENT_ID=B7GifYZWzh5qnX7apDwopEO8zCxawPFZ
+      - OAUTH2_PROXY_CLIENT_SECRET=fNu00uWc_FZGTmgAKXoqy0EGRXzgK6-het4siWfdNSSY-bg5cLAxZUVMkWfJu0F6
+      - OAUTH2_PROXY_OIDC_ISSUER_URL=https://dev-qi020xjmtbbewf70.us.auth0.com/
+      - OAUTH2_PROXY_REDIRECT_URL=http://localhost/oauth2/callback
+      # 🔥 Necesarios para cookies y redirección correcta
+      - OAUTH2_PROXY_COOKIE_DOMAINS=localhost
+      - OAUTH2_PROXY_WHITELIST_DOMAINS=localhost
+
+      # 🔥 La app final donde debe mandarte
+      - OAUTH2_PROXY_UPSTREAMS=http://homer:8080/
+
+      # Opcionales pero recomendados
+      - OAUTH2_PROXY_EMAIL_DOMAINS=*
+      - OAUTH2_PROXY_COOKIE_SECURE=false
+      - OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.oauth2-proxy.rule=Host(`localhost`) && PathPrefix(`/oauth2/`)"
+      - "traefik.http.routers.oauth2-proxy.entrypoints=web"
+      - "traefik.http.routers.oauth2-proxy.priority=100"
+      - "traefik.http.services.oauth2-proxy.loadbalancer.server.port=4180"
+
+  traefik:
+    build: ./traefik
+    restart: unless-stopped
+    networks:
+      - edge-net
+      - backend-net
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - traefik_data:/certs
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+networks:
+  edge-net:
+    driver: bridge
+  backend-net:
+    driver: bridge
+  data-net:
+    driver: bridge
